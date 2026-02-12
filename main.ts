@@ -2,11 +2,39 @@ import { serveFile, serveDir } from "jsr:@std/http@1/file-server";
 
 const clients = new Map<string, WebSocket>();
 
+// Security: Validate access token
+const ACCESS_TOKEN = Deno.env.get("ACCESS_TOKEN");
+
+if (!ACCESS_TOKEN) {
+  console.error("❌ ERROR: ACCESS_TOKEN environment variable is required");
+  console.error("Generate a secure token with: crypto.randomUUID() or any secure random string");
+  console.error("Start server with: ACCESS_TOKEN=your-secret-token deno task dev");
+  Deno.exit(1);
+}
+
+console.log(`✅ Server starting with authentication enabled`);
+console.log(`🔐 Access token is configured (length: ${ACCESS_TOKEN.length} chars)`);
+
+function validateToken(req: Request): boolean {
+  const url = new URL(req.url);
+  const token = url.searchParams.get("token");
+  return token === ACCESS_TOKEN;
+}
+
 Deno.serve(async (req) => {
   const url = new URL(req.url);
 
   // WebSocket endpoint for signaling
   if (url.pathname === "/ws" && req.headers.get("upgrade") === "websocket") {
+    // Validate token before upgrading connection
+    if (!validateToken(req)) {
+      console.warn(`[${new Date().toISOString()}] Unauthorized WebSocket connection attempt from ${req.headers.get("x-forwarded-for") || "unknown"}`);
+      return new Response(JSON.stringify({ error: "Unauthorized - Invalid or missing token" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
     const { socket, response } = Deno.upgradeWebSocket(req);
     const clientId = crypto.randomUUID();
 
@@ -71,6 +99,8 @@ Deno.serve(async (req) => {
   }
   
   // Serve static files from public/
+  // Note: HTML pages are NOT protected - they contain the JS to prompt for token
+  // Security is enforced at the WebSocket endpoint where actual data flows
   try {
     // Let serveDir handle directory index resolution (index.html), content-type, and range requests.
     return await serveDir(req, { fsRoot: "./public", urlRoot: "" });

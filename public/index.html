@@ -115,11 +115,34 @@
   <script>
     let peerConnection = null;
     let ws = null;
+    let accessToken = null;
 
     const videoElement = document.getElementById('video');
     const statusElement = document.getElementById('status');
 
     console.log('Viewer page loaded. Video element:', videoElement ? 'found' : 'NOT FOUND');
+
+    // Authentication - Check for token on load
+    function checkAuthentication() {
+      accessToken = sessionStorage.getItem('cloudwatch_token');
+      
+      if (!accessToken) {
+        const token = prompt('🔐 Enter access token to view camera feed:');
+        if (!token) {
+          updateStatus('❌ Authentication required', 'disconnected');
+          return false;
+        }
+        accessToken = token.trim();
+        sessionStorage.setItem('cloudwatch_token', accessToken);
+      }
+
+      updateStatus('Ready to connect', 'disconnected');
+      console.log('✅ Token ready');
+      return true;
+    }
+
+    // Run authentication check
+    checkAuthentication();
 
     function updateStatus(message, type = 'connecting') {
       statusElement.innerHTML = `<span class="status-dot"></span>${message}`;
@@ -129,11 +152,17 @@
 
     async function connectToCamera() {
       try {
+        if (!accessToken) {
+          updateStatus('❌ Not authenticated', 'disconnected');
+          alert('Please refresh the page and enter your access token.');
+          return;
+        }
+
         updateStatus('Connecting to camera...', 'connecting');
 
-        // Connect WebSocket
+        // Connect WebSocket with token
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws?token=${encodeURIComponent(accessToken)}`);
 
         ws.onopen = () => {
           console.log('WebSocket connected');
@@ -149,8 +178,15 @@
           updateStatus('Connection error', 'disconnected');
         };
 
-        ws.onclose = () => {
-          updateStatus('Disconnected', 'disconnected');
+        ws.onclose = (event) => {
+          // Check if connection was rejected due to auth
+          if (event.code === 1008 || event.code === 1006) {
+            sessionStorage.removeItem('cloudwatch_token');
+            accessToken = null;
+            updateStatus('❌ Invalid token - reconnect to retry', 'disconnected');
+          } else {
+            updateStatus('Disconnected', 'disconnected');
+          }
         };
       } catch (error) {
         console.error('Error:', error);

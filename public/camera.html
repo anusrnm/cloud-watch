@@ -116,12 +116,35 @@
     let localStream = null;
     let peerConnection = null;
     let ws = null;
+    let accessToken = null;
 
     const videoElement = document.getElementById('video');
     const statusElement = document.getElementById('status');
 
     // Verify page loaded correctly
     console.log('Camera page loaded. Video element:', videoElement ? 'found' : 'NOT FOUND');
+
+    // Authentication - Check for token on load
+    function checkAuthentication() {
+      accessToken = sessionStorage.getItem('cloudwatch_token');
+      
+      if (!accessToken) {
+        const token = prompt('🔐 Enter access token to broadcast camera:');
+        if (!token) {
+          updateStatus('❌ Authentication required', 'disconnected');
+          return false;
+        }
+        accessToken = token.trim();
+        sessionStorage.setItem('cloudwatch_token', accessToken);
+      }
+
+      updateStatus('Start Camera', 'connecting');
+      console.log('✅ Token ready');
+      return true;
+    }
+
+    // Run authentication check
+    checkAuthentication();
     if (!videoElement) {
       alert('ERROR: Video element not found in DOM');
     }
@@ -147,8 +170,13 @@
 
     async function connectWebSocket() {
       return new Promise((resolve, reject) => {
+        if (!accessToken) {
+          reject(new Error('Not authenticated'));
+          return;
+        }
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const wsUrl = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(accessToken)}`;
         console.log('Connecting to WebSocket:', wsUrl);
         
         ws = new WebSocket(wsUrl);
@@ -180,16 +208,30 @@
           reject(error);
         };
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           clearTimeout(timeout);
-          console.log('WebSocket disconnected');
-          updateStatus('Broadcasting ended', 'disconnected');
+          // Check if connection was rejected due to auth
+          if (event.code === 1008 || event.code === 1006) {
+            sessionStorage.removeItem('cloudwatch_token');
+            accessToken = null;
+            updateStatus('❌ Invalid token - reconnect to retry', 'disconnected');
+            alert('Authentication failed. Your token is invalid. Please refresh and enter the correct token.');
+          } else {
+            console.log('WebSocket disconnected');
+            updateStatus('Broadcasting ended', 'disconnected');
+          }
         };
       });
     }
 
     async function startCamera() {
       try {
+        if (!accessToken) {
+          updateStatus('❌ Not authenticated', 'disconnected');
+          alert('Please refresh the page and enter your access token.');
+          return;
+        }
+
         updateStatus('Requesting camera access...', 'connecting');
 
         // Get camera stream FIRST (don't wait for WebSocket)

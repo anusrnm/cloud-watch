@@ -1,7 +1,12 @@
 {
   "tasks": {
-    "dev": "deno run --allow-net --allow-read main.ts",
+    "dev": "deno run --allow-net --allow-read --allow-env main.ts",
     "deploy": "deployctl deploy main.ts"
+  },
+  "_comments": {
+    "env": "Set ACCESS_TOKEN environment variable before running.",
+    "example": "ACCESS_TOKEN=your-secure-token-here deno task dev",
+    "generate": "Generate token in Deno REPL: crypto.randomUUID()"
   },
   "imports": {
     "@std/": "jsr:@std@1/"
