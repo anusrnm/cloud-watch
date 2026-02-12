@@ -1,4 +1,4 @@
-import { serveFile } from "jsr:@std/http@1/file-server";
+import { serveFile, serveDir } from "jsr:@std/http@1/file-server";
 
 const clients = new Map<string, WebSocket>();
 
@@ -66,10 +66,16 @@ Deno.serve(async (req) => {
     return response;
   }
 
+  if (url.pathname === "/favicon.ico") {
+    return new Response(null, { status: 204 });
+  }
+  
   // Serve static files from public/
   try {
-    return await serveFile(req, `./public${url.pathname}`);
-  } catch {
+    // Let serveDir handle directory index resolution (index.html), content-type, and range requests.
+    return await serveDir(req, { fsRoot: "./public", urlRoot: "" });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Static serve error for ${url.pathname}:`, err);
     return new Response("Not Found", { status: 404 });
   }
 });
