@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Baby Monitor - Viewer</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #1a1a1a;
+      font-family: Arial;
+      color: white;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    h1 { text-align: center; }
+    video {
+      width: 100%;
+      height: auto;
+      min-height: 400px;
+      border-radius: 8px;
+      background: #000;
+      margin: 20px 0;
+      object-fit: cover;
+      display: block;
+      border: 2px solid #28a745;
+    }
+    .status {
+      padding: 10px;
+      border-radius: 4px;
+      text-align: center;
+      margin: 10px 0;
+      font-weight: bold;
+    }
+    .status.connected { background: #28a745; }
+    .status.connecting { background: #ffc107; }
+    .status.disconnected { background: #dc3545; }
+    button {
+      width: 100%;
+      padding: 15px;
+      margin: 10px 0;
+      font-size: 16px;
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      background: #007bff;
+      color: white;
+    }
+    button:hover { background: #0056b3; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>👶 Baby Monitor Viewer</h1>
+    <div class="status disconnected" id="status">Not connected</div>
+    <video id="video" autoplay playsinline></video>
+    <button onclick="connectToCamera()">Connect to Camera</button>
+    <button onclick="disconnect()">Disconnect</button>
+    <p style="font-size: 12px; text-align: center; color: #999;">
+      Make sure baby's mobile device is running the camera feed.
+    </p>
+  </div>
+
+  <script>
+    let peerConnection = null;
+    let ws = null;
+
+    const videoElement = document.getElementById('video');
+    const statusElement = document.getElementById('status');
+
+    console.log('Viewer page loaded. Video element:', videoElement ? 'found' : 'NOT FOUND');
+
+    function updateStatus(message, type = 'connecting') {
+      statusElement.textContent = message;
+      statusElement.className = `status ${type}`;
+      console.log(`[Status] ${message}`);
+    }
+
+    async function connectToCamera() {
+      try {
+        updateStatus('Connecting to camera...', 'connecting');
+
+        // Connect WebSocket
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+        ws.onopen = () => {
+          console.log('WebSocket connected');
+          createPeerConnection();
+        };
+
+        ws.onmessage = (event) => {
+          handleSignalingMessage(JSON.parse(event.data));
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          updateStatus('Connection error', 'disconnected');
+        };
+
+        ws.onclose = () => {
+          updateStatus('Disconnected', 'disconnected');
+        };
+      } catch (error) {
+        console.error('Error:', error);
+        updateStatus(`Error: ${error.message}`, 'disconnected');
+      }
+    }
+
+    function createPeerConnection() {
+      console.log('Creating peer connection...');
+      peerConnection = new RTCPeerConnection({
+        iceServers: [
+          { urls: ['stun:stun.l.google.com:19302'] },
+          { urls: ['stun:stun1.l.google.com:19302'] }
+        ]
+      });
+
+      console.log('Setting up ontrack handler...');
+      // Handle remote stream
+      peerConnection.ontrack = (event) => {
+        console.log('🎯 ONTRACK EVENT TRIGGERED!', event.track.kind, 'streams:', event.streams.length);
+        if (event.streams.length > 0) {
+          console.log('Setting video srcObject to remote stream');
+          videoElement.srcObject = event.streams[0];
+          updateStatus('✓ Connected', 'connected');
+        } else {
+          console.warn('Received track but no streams available');
+        }
+      };
+
+      // Send ICE candidates
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log('Sending ICE candidate from viewer');
+          ws.send(JSON.stringify({
+            type: 'ice-candidate',
+            candidate: event.candidate
+          }));
+        }
+      };
+
+      peerConnection.onconnectionstatechange = () => {
+        console.log('Connection state changed:', peerConnection.connectionState);
+        if (peerConnection.connectionState === 'failed') {
+          updateStatus('Connection failed - Retrying...', 'disconnected');
+        }
+      };
+
+      peerConnection.oniceconnectionstatechange = () => {
+        console.log('ICE connection state:', peerConnection.iceConnectionState);
+      };
+
+      console.log('Peer connection created, calling makeOffer');
+      // Send offer to camera
+      makeOffer();
+    }
+
+    async function makeOffer() {
+      try {
+        console.log('Creating offer...');
+        const offer = await peerConnection.createOffer();
+        console.log('Setting local description');
+        await peerConnection.setLocalDescription(offer);
+        
+        console.log('Sending offer via WebSocket');
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'offer',
+            offer: offer
+          }));
+          console.log('Offer sent successfully');
+        } else {
+          console.error('WebSocket not ready. State:', ws?.readyState);
+        }
+      } catch (error) {
+        console.error('Error creating offer:', error);
+        updateStatus('Failed to create offer', 'disconnected');
+      }
+    }
+
+    async function handleSignalingMessage(message) {
+      try {
+        console.log('💬 Signaling message received:', message.type);
+        if (message.type === 'answer') {
+          console.log('Processing answer...');
+          if (!peerConnection) {
+            console.error('ERROR: No peer connection when receiving answer!');
+            return;
+          }
+          console.log('Setting remote description with answer');
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+          console.log('✓ Answer set successfully. ICE state:', peerConnection.iceConnectionState);
+        } else if (message.type === 'ice-candidate' && peerConnection) {
+          console.log('🧊 ICE CANDIDATE RECEIVED from camera:', message.candidate ? 'valid' : 'invalid');
+          if (message.candidate) {
+            console.log('Adding ICE candidate:', message.candidate.candidate?.substring(0, 50));
+            try {
+              await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+              console.log('✓ ICE candidate added successfully');
+            } catch (e) {
+              console.warn('Could not add ICE candidate:', e.message);
+            }
+          }
+        } else if (message.type === 'ice-candidate' && !peerConnection) {
+          console.warn('⚠️ Received ICE candidate but no peer connection exists!');
+        } else {
+          console.warn('Unexpected message type:', message.type);
+        }
+      } catch (error) {
+        console.error('Error handling signaling message:', error, message);
+      }
+    }
+
+    function disconnect() {
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      videoElement.srcObject = null;
+      updateStatus('Disconnected', 'disconnected');
+    }
+
+    window.addEventListener('beforeunload', disconnect);
+  </script>
+</body>
+</html>

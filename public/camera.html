@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Baby Monitor - Camera Feed</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #000;
+      font-family: Arial;
+      color: white;
+    }
+    .container {
+      max-width: 640px;
+      margin: 0 auto;
+    }
+    h1 { text-align: center; }
+    video {
+      width: 100%;
+      height: auto;
+      min-height: 400px;
+      border-radius: 8px;
+      background: #1a1a1a;
+      margin: 20px 0;
+      object-fit: cover;
+      display: block;
+      border: 2px solid #28a745;
+    }
+    .status {
+      padding: 10px;
+      border-radius: 4px;
+      text-align: center;
+      margin: 10px 0;
+      font-weight: bold;
+    }
+    .status.connected { background: #28a745; }
+    .status.connecting { background: #ffc107; }
+    .status.disconnected { background: #dc3545; }
+    button {
+      width: 100%;
+      padding: 15px;
+      margin: 10px 0;
+      font-size: 16px;
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      background: #007bff;
+      color: white;
+    }
+    button:hover { background: #0056b3; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📱 Baby Monitor Camera</h1>
+    <div class="status connecting" id="status">Initializing...</div>
+    <video id="video" autoplay playsinline muted></video>
+    <button onclick="startCamera()">Start Camera</button>
+    <button onclick="stopCamera()">Stop Camera</button>
+    <p style="font-size: 12px; text-align: center; color: #999;">
+      Keep this tab open. Parents can view the feed from their device.
+    </p>
+  </div>
+
+  <script>
+    let localStream = null;
+    let peerConnection = null;
+    let ws = null;
+
+    const videoElement = document.getElementById('video');
+    const statusElement = document.getElementById('status');
+
+    // Verify page loaded correctly
+    console.log('Camera page loaded. Video element:', videoElement ? 'found' : 'NOT FOUND');
+    if (!videoElement) {
+      alert('ERROR: Video element not found in DOM');
+    }
+
+    // Debug video element
+    videoElement.onloadedmetadata = () => {
+      console.log('Video metadata loaded. Dimensions:', videoElement.videoWidth, 'x', videoElement.videoHeight);
+    };
+
+    videoElement.onplay = () => {
+      console.log('Video playback started');
+    };
+
+    videoElement.onerror = (error) => {
+      console.error('Video element error:', error);
+    };
+
+    function updateStatus(message, type = 'connecting') {
+      statusElement.textContent = message;
+      statusElement.className = `status ${type}`;
+      console.log(`[Status] ${message}`);
+    }
+
+    async function connectWebSocket() {
+      return new Promise((resolve, reject) => {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        console.log('Connecting to WebSocket:', wsUrl);
+        
+        ws = new WebSocket(wsUrl);
+
+        const timeout = setTimeout(() => {
+          reject(new Error('WebSocket connection timeout'));
+          ws.close();
+        }, 5000);
+
+        ws.onopen = () => {
+          clearTimeout(timeout);
+          console.log('WebSocket connected');
+          updateStatus('Connected - Camera broadcasting', 'connected');
+          resolve();
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            handleSignalingMessage(JSON.parse(event.data));
+          } catch (error) {
+            console.error('Failed to parse WebSocket message:', error, event.data);
+          }
+        };
+
+        ws.onerror = (error) => {
+          clearTimeout(timeout);
+          console.error('WebSocket error:', error);
+          updateStatus('Broadcasting unavailable (offline)', 'disconnected');
+          reject(error);
+        };
+
+        ws.onclose = () => {
+          clearTimeout(timeout);
+          console.log('WebSocket disconnected');
+          updateStatus('Broadcasting ended', 'disconnected');
+        };
+      });
+    }
+
+    async function startCamera() {
+      try {
+        updateStatus('Requesting camera access...', 'connecting');
+
+        // Get camera stream FIRST (don't wait for WebSocket)
+        console.log('Requesting camera permissions...');
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+
+        console.log('Camera stream acquired, displaying...');
+        videoElement.srcObject = localStream;
+        
+        // Ensure video starts playing
+        try {
+          await videoElement.play();
+        } catch (playError) {
+          console.warn('Auto-play failed (may be browser policy):', playError);
+        }
+        
+        updateStatus('📹 Camera active - Connecting to broadcast...', 'connecting');
+
+        // Initialize WebRTC with the stream
+        initPeerConnection();
+
+        // Connect WebSocket in parallel (non-blocking)
+        connectWebSocket().catch((error) => {
+          console.error('Failed to connect WebSocket:', error);
+          updateStatus('📹 Camera active - Broadcast unavailable', 'disconnected');
+        });
+      } catch (error) {
+        console.error('Error accessing camera:', error);
+        const errorMsg = error.name === 'NotAllowedError' 
+          ? 'Camera permission denied' 
+          : error.name === 'NotFoundError' 
+          ? 'No camera found' 
+          : error.message;
+        updateStatus(`❌ Camera error: ${errorMsg}`, 'disconnected');
+        alert(`Camera Error: ${errorMsg}\n\nPlease check:\n- Camera permissions\n- Camera is not in use by another app`);
+      }
+    }
+
+    function initPeerConnection() {
+      console.log('Initializing peer connection...');
+      peerConnection = new RTCPeerConnection({
+        iceServers: [
+          { urls: ['stun:stun.l.google.com:19302'] },
+          { urls: ['stun:stun1.l.google.com:19302'] }
+        ]
+      });
+
+      // Add local stream to peer connection
+      if (!localStream) {
+        console.error('ERROR: localStream is null when initializing peer connection');
+        return;
+      }
+
+      const tracks = localStream.getTracks();
+      console.log('Adding', tracks.length, 'tracks to peer connection');
+      tracks.forEach((track, index) => {
+        console.log(`Adding track ${index}:`, track.kind, track.enabled ? 'enabled' : 'disabled');
+        peerConnection.addTrack(track, localStream);
+      });
+
+      // Send ICE candidates to viewer
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log('Sending ICE candidate');
+          ws.send(JSON.stringify({
+            type: 'ice-candidate',
+            candidate: event.candidate
+          }));
+        }
+      };
+
+      peerConnection.onconnectionstatechange = () => {
+        console.log('Connection state:', peerConnection.connectionState);
+        if (peerConnection.connectionState === 'connected') {
+          updateStatus('✓ Viewer connected', 'connected');
+        } else if (peerConnection.connectionState === 'failed') {
+          updateStatus('❌ Connection failed', 'disconnected');
+        }
+      };
+
+      console.log('Peer connection initialized');
+    }
+
+    async function handleSignalingMessage(message) {
+      try {
+        console.log('Received signaling message, type:', message.type);
+        
+        if (message.type === 'offer') {
+          if (!peerConnection) {
+            console.log('No peer connection yet, creating one...');
+            initPeerConnection();
+          }
+
+          // Validate offer data
+          if (!message.offer || !message.offer.sdp) {
+            console.error('Invalid offer: missing SDP', message);
+            return;
+          }
+
+          console.log('Setting remote description (offer)');
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+
+          console.log('Sending answer');
+          ws.send(JSON.stringify({
+            type: 'answer',
+            answer: answer
+          }));
+        } else if (message.type === 'ice-candidate' && peerConnection) {
+          if (!message.candidate) {
+            console.warn('Invalid ICE candidate: missing data', message);
+            return;
+          }
+          try {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+          } catch (error) {
+            console.error('Error adding ICE candidate:', error);
+          }
+        } else if (message.type) {
+          console.warn('Unknown message type:', message.type);
+        } else {
+          console.warn('Message without type:', message);
+        }
+      } catch (error) {
+        console.error('Error handling signaling message:', error, 'Message:', message);
+        // Try to recover by reconnecting
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      }
+    }
+
+    function stopCamera() {
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+        localStream = null;
+      }
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      videoElement.srcObject = null;
+      updateStatus('Stopped', 'disconnected');
+    }
+
+    // Auto-cleanup on page unload
+    window.addEventListener('beforeunload', stopCamera);
+  </script>
+</body>
+</html>

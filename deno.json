@@ -1,0 +1,9 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-read main.ts",
+    "deploy": "deployctl deploy main.ts"
+  },
+  "imports": {
+    "@std/": "jsr:@std@1/"
+  }
+}
