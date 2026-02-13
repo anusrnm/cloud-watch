@@ -33,6 +33,7 @@
       object-fit: cover;
       display: block;
       border: 2px solid #28a745;
+      cursor: pointer;
     }
     .status {
       text-align: center;
@@ -105,7 +106,7 @@
   <div class="container">
     <div class="status disconnected" id="status"><span class="status-dot"></span>Disconnected</div>
     <p class="info">Make sure home device is running the camera feed.</p>
-    <video id="video" autoplay playsinline></video>
+    <video id="video" autoplay playsinline muted></video>
     <div class="button-group">
       <button onclick="connectToCamera()" title="Connect to camera">🔌</button>
       <button onclick="disconnect()" data-disconnect title="Disconnect">⏹️</button>
@@ -116,11 +117,25 @@
     let peerConnection = null;
     let ws = null;
     let accessToken = null;
+    let iceCandidateQueue = []; // Queue for ICE candidates that arrive before remote description
+    let remoteDescriptionSet = false; // Track if remote description is ready
 
     const videoElement = document.getElementById('video');
     const statusElement = document.getElementById('status');
 
     console.log('Viewer page loaded. Video element:', videoElement ? 'found' : 'NOT FOUND');
+
+    // Allow manual play on tap/click if autoplay fails
+    videoElement.addEventListener('click', async () => {
+      if (videoElement.paused && videoElement.srcObject) {
+        try {
+          await videoElement.play();
+          console.log('✓ Video playback started by user interaction');
+        } catch (error) {
+          console.error('Failed to play video:', error);
+        }
+      }
+    });
 
     // Authentication - Check for token on load
     function checkAuthentication() {
@@ -158,6 +173,23 @@
           return;
         }
 
+        // Clean up any existing connections before reconnecting
+        if (peerConnection) {
+          console.log('Cleaning up existing peer connection');
+          peerConnection.close();
+          peerConnection = null;
+        }
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
+          console.log('Cleaning up existing WebSocket');
+          ws.close(1000, 'Reconnecting');
+          ws = null;
+        }
+        if (videoElement.srcObject) {
+          videoElement.srcObject = null;
+        }
+        iceCandidateQueue = [];
+        remoteDescriptionSet = false;
+
         updateStatus('Connecting to camera...', 'connecting');
 
         // Connect WebSocket with token
@@ -187,6 +219,14 @@
           } else {
             updateStatus('Disconnected', 'disconnected');
           }
+          
+          // Reset state for reconnection
+          if (peerConnection) {
+            peerConnection.close();
+            peerConnection = null;
+          }
+          iceCandidateQueue = [];
+          remoteDescriptionSet = false;
         };
       } catch (error) {
         console.error('Error:', error);
@@ -196,6 +236,11 @@
 
     function createPeerConnection() {
       console.log('Creating peer connection...');
+      
+      // Reset ICE candidate state for new peer connection
+      iceCandidateQueue = [];
+      remoteDescriptionSet = false;
+      
       peerConnection = new RTCPeerConnection({
         iceServers: [
           { urls: ['stun:stun.l.google.com:19302'] },
@@ -209,12 +254,21 @@
 
       console.log('Setting up ontrack handler...');
       // Handle remote stream
-      peerConnection.ontrack = (event) => {
+      peerConnection.ontrack = async (event) => {
         console.log('🎯 ONTRACK EVENT TRIGGERED!', event.track.kind, 'streams:', event.streams.length);
         if (event.streams.length > 0) {
           console.log('Setting video srcObject to remote stream');
           videoElement.srcObject = event.streams[0];
-          updateStatus('✓ Connected', 'connected');
+          
+          // Explicitly play the video (required for mobile)
+          try {
+            await videoElement.play();
+            console.log('✓ Video playback started');
+            updateStatus('✓ Connected', 'connected');
+          } catch (playError) {
+            console.warn('Autoplay blocked, waiting for user interaction:', playError);
+            updateStatus('✓ Connected - Tap video to play', 'connected');
+          }
         } else {
           console.warn('Received track but no streams available');
         }
@@ -232,9 +286,33 @@
       };
 
       peerConnection.onconnectionstatechange = () => {
-        console.log('Connection state changed:', peerConnection.connectionState);
-        if (peerConnection.connectionState === 'failed') {
-          updateStatus('Connection failed - Retrying...', 'disconnected');
+        const state = peerConnection.connectionState;
+        console.log('Peer Connection state:', state);
+        
+        switch(state) {
+          case 'connected':
+            updateStatus('✓ Connected', 'connected');
+            break;
+          case 'connecting':
+            updateStatus('⏳ Connecting to camera...', 'connecting');
+            break;
+          case 'disconnected':
+            updateStatus('⚠️ Connection lost', 'connecting');
+            // Note: Connection might recover on its own, so we don't immediately reconnect
+            // If it doesn't recover, it will transition to 'failed' and trigger reconnection
+            break;
+          case 'failed':
+            updateStatus('❌ Connection failed', 'disconnected');
+            // Try to reconnect
+            setTimeout(() => {
+              console.log('Attempting to reconnect after failure');
+              disconnect();
+              connectToCamera();
+            }, 2000);
+            break;
+          case 'closed':
+            updateStatus('Disconnected', 'disconnected');
+            break;
         }
       };
 
@@ -281,16 +359,35 @@
           }
           console.log('Setting remote description with answer');
           await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+          remoteDescriptionSet = true;
           console.log('✓ Answer set successfully. ICE state:', peerConnection.iceConnectionState);
+          
+          // Now add any queued ICE candidates
+          console.log(`Processing ${iceCandidateQueue.length} queued ICE candidates`);
+          for (const candidate of iceCandidateQueue) {
+            try {
+              await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+              console.log('✓ Queued ICE candidate added');
+            } catch (e) {
+              console.warn('Could not add queued ICE candidate:', e.message);
+            }
+          }
+          iceCandidateQueue = [];
         } else if (message.type === 'ice-candidate' && peerConnection) {
           console.log('🧊 ICE CANDIDATE RECEIVED from camera:', message.candidate ? 'valid' : 'invalid');
           if (message.candidate) {
             console.log('Adding ICE candidate:', message.candidate.candidate?.substring(0, 50));
-            try {
-              await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
-              console.log('✓ ICE candidate added successfully');
-            } catch (e) {
-              console.warn('Could not add ICE candidate:', e.message);
+            
+            if (!remoteDescriptionSet) {
+              console.log('⏳ Remote description not ready, queueing ICE candidate');
+              iceCandidateQueue.push(message.candidate);
+            } else {
+              try {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                console.log('✓ ICE candidate added successfully');
+              } catch (e) {
+                console.warn('Could not add ICE candidate:', e.message);
+              }
             }
           }
         } else if (message.type === 'ice-candidate' && !peerConnection) {
@@ -309,10 +406,12 @@
         peerConnection = null;
       }
       if (ws) {
-        ws.close();
+        ws.close(1000, 'User disconnected');
         ws = null;
       }
       videoElement.srcObject = null;
+      iceCandidateQueue = [];
+      remoteDescriptionSet = false;
       updateStatus('Disconnected', 'disconnected');
     }
 

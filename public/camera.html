@@ -117,6 +117,8 @@
     let peerConnection = null;
     let ws = null;
     let accessToken = null;
+    let iceCandidateQueue = []; // Queue for ICE candidates that arrive before remote description
+    let remoteDescriptionSet = false; // Track if remote description is ready
 
     const videoElement = document.getElementById('video');
     const statusElement = document.getElementById('status');
@@ -189,7 +191,7 @@
         ws.onopen = () => {
           clearTimeout(timeout);
           console.log('WebSocket connected');
-          updateStatus('Connected - Camera broadcasting', 'connected');
+          updateStatus('📹 Camera active - Waiting for viewer', 'connecting');
           resolve();
         };
 
@@ -210,16 +212,31 @@
 
         ws.onclose = (event) => {
           clearTimeout(timeout);
+          console.log('WebSocket closed. Code:', event.code, 'Clean:', event.wasClean);
+          
           // Check if connection was rejected due to auth
           if (event.code === 1008 || event.code === 1006) {
             sessionStorage.removeItem('cloudwatch_token');
             accessToken = null;
             updateStatus('❌ Invalid token - reconnect to retry', 'disconnected');
             alert('Authentication failed. Your token is invalid. Please refresh and enter the correct token.');
+          } else if (event.code === 1000 || event.code === 1005) {
+            // Normal closure (1000 = explicit, 1005 = no status during cleanup)
+            console.log('WebSocket closed normally');
+            updateStatus('Broadcasting stopped', 'disconnected');
           } else {
-            console.log('WebSocket disconnected');
-            updateStatus('Broadcasting ended', 'disconnected');
+            // Unexpected closure
+            console.warn('WebSocket closed unexpectedly. Code:', event.code);
+            updateStatus('❌ Broadcast connection lost', 'disconnected');
           }
+          
+          // Reset state for reconnection
+          if (peerConnection && peerConnection.connectionState !== 'closed') {
+            peerConnection.close();
+          }
+          peerConnection = null;
+          iceCandidateQueue = [];
+          remoteDescriptionSet = false;
         };
       });
     }
@@ -231,6 +248,25 @@
           alert('Please refresh the page and enter your access token.');
           return;
         }
+
+        // Clean up any existing connections before reconnecting
+        if (peerConnection) {
+          console.log('Cleaning up existing peer connection');
+          peerConnection.close();
+          peerConnection = null;
+        }
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
+          console.log('Cleaning up existing WebSocket');
+          ws.close(1000, 'Reconnecting');
+          ws = null;
+        }
+        if (localStream) {
+          console.log('Cleaning up existing media stream');
+          localStream.getTracks().forEach(track => track.stop());
+          localStream = null;
+        }
+        iceCandidateQueue = [];
+        remoteDescriptionSet = false;
 
         updateStatus('Requesting camera access...', 'connecting');
 
@@ -256,14 +292,15 @@
         
         updateStatus('📹 Camera active - Connecting to broadcast...', 'connecting');
 
-        // Initialize WebRTC with the stream
-        initPeerConnection();
-
-        // Connect WebSocket in parallel (non-blocking)
-        connectWebSocket().catch((error) => {
+        // Connect WebSocket FIRST (must be connected before ICE candidates)
+        try {
+          await connectWebSocket();
+          console.log('WebSocket connected, waiting for viewer to connect...');
+          // Don't initialize peer connection yet - wait for offer from viewer
+        } catch (error) {
           console.error('Failed to connect WebSocket:', error);
           updateStatus('📹 Camera active - Broadcast unavailable', 'disconnected');
-        });
+        }
       } catch (error) {
         console.error('Error accessing camera:', error);
         const errorMsg = error.name === 'NotAllowedError' 
@@ -278,6 +315,11 @@
 
     function initPeerConnection() {
       console.log('Initializing peer connection...');
+      
+      // Reset ICE candidate state for new peer connection
+      iceCandidateQueue = [];
+      remoteDescriptionSet = false;
+      
       peerConnection = new RTCPeerConnection({
         iceServers: [
           { urls: ['stun:stun.l.google.com:19302'] },
@@ -288,6 +330,11 @@
       // Add local stream to peer connection
       if (!localStream) {
         console.error('ERROR: localStream is null when initializing peer connection');
+        return;
+      }
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.error('ERROR: WebSocket not connected when initializing peer connection');
         return;
       }
 
@@ -310,11 +357,39 @@
       };
 
       peerConnection.onconnectionstatechange = () => {
-        console.log('Connection state:', peerConnection.connectionState);
-        if (peerConnection.connectionState === 'connected') {
-          updateStatus('✓ Viewer connected', 'connected');
-        } else if (peerConnection.connectionState === 'failed') {
-          updateStatus('❌ Connection failed', 'disconnected');
+        const state = peerConnection.connectionState;
+        console.log('Peer Connection state:', state);
+        
+        switch(state) {
+          case 'connected':
+            updateStatus('✓ Viewer connected', 'connected');
+            break;
+          case 'connecting':
+            updateStatus('⏳ Connecting to viewer...', 'connecting');
+            break;
+          case 'disconnected':
+            updateStatus('📹 Camera active - Viewer disconnected', 'connecting');
+            break;
+          case 'failed':
+            updateStatus('❌ Connection failed - Retrying...', 'disconnected');
+            break;
+          case 'closed':
+            updateStatus('📹 Camera active - Waiting for viewer', 'connecting');
+            break;
+        }
+      };
+
+      peerConnection.oniceconnectionstatechange = () => {
+        const iceState = peerConnection.iceConnectionState;
+        console.log('ICE Connection state:', iceState);
+        
+        // Supplement the connection state changes with ICE state
+        if (iceState === 'disconnected') {
+          updateStatus('📹 Camera active - Viewer disconnected', 'connecting');
+        } else if (iceState === 'failed') {
+          updateStatus('📹 Camera active - Waiting for viewer', 'connecting');
+        } else if (iceState === 'closed') {
+          updateStatus('📹 Camera active - Ready to broadcast', 'connecting');
         }
       };
 
@@ -326,19 +401,27 @@
         console.log('Received signaling message, type:', message.type);
         
         if (message.type === 'offer') {
-          if (!peerConnection) {
-            console.log('No peer connection yet, creating one...');
-            initPeerConnection();
-          }
-
-          // Validate offer data
+          // Validate offer data first
           if (!message.offer || !message.offer.sdp) {
             console.error('Invalid offer: missing SDP', message);
             return;
           }
 
+          // Close existing peer connection if it exists (new connection attempt)
+          if (peerConnection) {
+            console.log('Closing existing peer connection for new offer');
+            peerConnection.close();
+            peerConnection = null;
+          }
+
+          // Create fresh peer connection for new offer
+          console.log('Creating new peer connection for incoming offer');
+          initPeerConnection();
+
           console.log('Setting remote description (offer)');
           await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+          remoteDescriptionSet = true;
+          
           const answer = await peerConnection.createAnswer();
           await peerConnection.setLocalDescription(answer);
 
@@ -347,15 +430,34 @@
             type: 'answer',
             answer: answer
           }));
+          
+          // Now add any queued ICE candidates from viewer
+          console.log(`Processing ${iceCandidateQueue.length} queued ICE candidates from viewer`);
+          for (const candidate of iceCandidateQueue) {
+            try {
+              await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+              console.log('✓ Viewer ICE candidate added');
+            } catch (error) {
+              console.warn('Could not add queued viewer ICE candidate:', error.message);
+            }
+          }
+          iceCandidateQueue = [];
         } else if (message.type === 'ice-candidate' && peerConnection) {
           if (!message.candidate) {
             console.warn('Invalid ICE candidate: missing data', message);
             return;
           }
-          try {
-            await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
-          } catch (error) {
-            console.error('Error adding ICE candidate:', error);
+          
+          if (!remoteDescriptionSet) {
+            console.log('⏳ Remote offer not processed yet, queueing ICE candidate from viewer');
+            iceCandidateQueue.push(message.candidate);
+          } else {
+            try {
+              await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+              console.log('✓ ICE candidate added from viewer');
+            } catch (error) {
+              console.warn('Could not add ICE candidate from viewer:', error.message);
+            }
           }
         } else if (message.type) {
           console.warn('Unknown message type:', message.type);
@@ -372,20 +474,33 @@
     }
 
     function stopCamera() {
+      console.log('Stopping camera broadcast...');
+      
       if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
+        localStream.getTracks().forEach(track => {
+          console.log(`Stopping ${track.kind} track`);
+          track.stop();
+        });
         localStream = null;
       }
+      
       if (peerConnection) {
+        console.log('Closing peer connection');
         peerConnection.close();
         peerConnection = null;
       }
+      
       if (ws) {
-        ws.close();
+        console.log('Closing WebSocket');
+        ws.close(1000, 'Camera stopped');
         ws = null;
       }
+      
       videoElement.srcObject = null;
-      updateStatus('Stopped', 'disconnected');
+      iceCandidateQueue = [];
+      remoteDescriptionSet = false;
+      updateStatus('Camera stopped', 'disconnected');
+      console.log('Camera broadcast stopped');
     }
 
     // Auto-cleanup on page unload
