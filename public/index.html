@@ -88,6 +88,36 @@
       color: #999;
       margin: 6px 0 0 0;
     }
+    .audio-meter {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin: 8px 0;
+      padding: 8px;
+      background: rgba(40, 167, 69, 0.1);
+      border-radius: 6px;
+      border: 1px solid rgba(40, 167, 69, 0.3);
+    }
+    .meter-bars {
+      display: flex;
+      gap: 4px;
+      align-items: flex-end;
+      height: 20px;
+    }
+    .meter-bar {
+      width: 4px;
+      background: linear-gradient(to top, #28a745, #20c997);
+      border-radius: 2px;
+      transition: height 0.1s ease;
+      height: 2px;
+    }
+    .meter-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #28a745;
+      min-width: 50px;
+    }
     /* Tablet: 640px - 1024px */
     @media (min-width: 640px) {
       body { padding: 12px; }
@@ -107,8 +137,19 @@
     <div class="status disconnected" id="status"><span class="status-dot"></span>Disconnected</div>
     <p class="info">Make sure home device is running the camera feed.</p>
     <video id="video" autoplay playsinline muted></video>
+    <div class="audio-meter" id="audioMeter">
+      <div class="meter-bars">
+        <div class="meter-bar" id="bar1"></div>
+        <div class="meter-bar" id="bar2"></div>
+        <div class="meter-bar" id="bar3"></div>
+        <div class="meter-bar" id="bar4"></div>
+        <div class="meter-bar" id="bar5"></div>
+      </div>
+      <span class="meter-label">🔊 Audio</span>
+    </div>
     <div class="button-group">
       <button onclick="connectToCamera()" title="Connect to camera">🔌</button>
+      <button onclick="toggleMute()" id="muteBtn" title="Unmute audio">🔇</button>
       <button onclick="disconnect()" data-disconnect title="Disconnect">⏹️</button>
     </div>
   </div>
@@ -119,9 +160,15 @@
     let accessToken = null;
     let iceCandidateQueue = []; // Queue for ICE candidates that arrive before remote description
     let remoteDescriptionSet = false; // Track if remote description is ready
+    let audioContext = null;
+    let analyser = null;
+    let animationId = null;
+    let isMuted = true; // Initially muted
 
     const videoElement = document.getElementById('video');
     const statusElement = document.getElementById('status');
+    const audioMeterElement = document.getElementById('audioMeter');
+    const muteBtn = document.getElementById('muteBtn');
 
     console.log('Viewer page loaded. Video element:', videoElement ? 'found' : 'NOT FOUND');
 
@@ -248,9 +295,11 @@
         ]
       });
 
-      // Add transceiver to indicate we want to receive video
+      // Add transceiver to indicate we want to receive video and audio
       console.log('Adding video transceiver (recvonly)...');
       peerConnection.addTransceiver('video', { direction: 'recvonly' });
+      console.log('Adding audio transceiver (recvonly)...');
+      peerConnection.addTransceiver('audio', { direction: 'recvonly' });
 
       console.log('Setting up ontrack handler...');
       // Handle remote stream
@@ -259,6 +308,12 @@
         if (event.streams.length > 0) {
           console.log('Setting video srcObject to remote stream');
           videoElement.srcObject = event.streams[0];
+          
+          // Set up audio analysis if this is an audio track
+          if (event.track.kind === 'audio') {
+            console.log('Audio track received, setting up analyzer...');
+            setupAudioAnalyzer(event.streams[0]);
+          }
           
           // Explicitly play the video (required for mobile)
           try {
@@ -409,10 +464,85 @@
         ws.close(1000, 'User disconnected');
         ws = null;
       }
+      if (animationId) {
+        cancelAnimationFrame(animationId);
+        animationId = null;
+      }
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+      analyser = null;
       videoElement.srcObject = null;
+      videoElement.muted = true;
+      isMuted = true;
+      muteBtn.textContent = '🔇';
+      muteBtn.title = 'Unmute audio';
       iceCandidateQueue = [];
       remoteDescriptionSet = false;
       updateStatus('Disconnected', 'disconnected');
+    }
+
+    function setupAudioAnalyzer(stream) {
+      try {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        
+        if (!analyser) {
+          const source = audioContext.createMediaStreamSource(stream);
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+        }
+        
+        // Start visualization
+        visualizeAudio();
+      } catch (error) {
+        console.warn('Could not set up audio analyzer:', error);
+      }
+    }
+
+    function visualizeAudio() {
+      if (!analyser) return;
+      
+      if (animationId) cancelAnimationFrame(animationId);
+      
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      
+      const animate = () => {
+        animationId = requestAnimationFrame(animate);
+        
+        analyser.getByteFrequencyData(dataArray);
+        
+        // Get average level
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i];
+        }
+        const average = sum / dataArray.length;
+        const level = (average / 255) * 100;
+        
+        // Update meter bars
+        const bars = document.querySelectorAll('.meter-bar');
+        const barHeight = (level / 100) * 20;
+        
+        bars.forEach((bar, index) => {
+          const frequency = dataArray[Math.floor((index / bars.length) * dataArray.length)];
+          const height = (frequency / 255) * 20;
+          bar.style.height = height + 'px';
+        });
+      };
+      
+      animate();
+    }
+
+    function toggleMute() {
+      isMuted = !isMuted;
+      videoElement.muted = isMuted;
+      muteBtn.textContent = isMuted ? '🔇' : '🔊';
+      muteBtn.title = isMuted ? 'Unmute audio' : 'Mute audio';
+      console.log('Audio', isMuted ? 'muted' : 'unmuted');
     }
 
     window.addEventListener('beforeunload', disconnect);
