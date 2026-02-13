@@ -37,18 +37,18 @@
     }
     .status {
       text-align: center;
-      margin: 8px 0;
+      margin: 4px 0;
       font-weight: 600;
-      font-size: 14px;
-      padding: 6px 0;
+      font-size: 12px;
+      padding: 4px 0;
       letter-spacing: 0.5px;
     }
     .status-dot {
       display: inline-block;
-      width: 8px;
-      height: 8px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
-      margin-right: 8px;
+      margin-right: 6px;
       vertical-align: middle;
     }
     .status.connected .status-dot { background: #28a745; }
@@ -83,40 +83,47 @@
       background: #5a6268;
     }
     .info {
-      font-size: 11px;
+      font-size: 10px;
       text-align: center;
       color: #999;
-      margin: 6px 0 0 0;
+      margin: 2px 0;
     }
     .audio-meter {
+      position: fixed;
+      top: 16px;
+      left: 16px;
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
-      margin: 8px 0;
-      padding: 8px;
-      background: rgba(40, 167, 69, 0.1);
-      border-radius: 6px;
-      border: 1px solid rgba(40, 167, 69, 0.3);
+      gap: 6px;
+      padding: 8px 12px;
+      background: rgba(40, 167, 69, 0.9);
+      backdrop-filter: blur(8px);
+      border-radius: 20px;
+      border: 1px solid rgba(40, 167, 69, 0.5);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+      transition: opacity 0.3s ease;
+      z-index: 1000;
+    }
+    .audio-meter.hidden {
+      opacity: 0.3;
+      pointer-events: none;
     }
     .meter-bars {
       display: flex;
-      gap: 4px;
+      gap: 3px;
       align-items: flex-end;
-      height: 20px;
+      height: 16px;
     }
     .meter-bar {
-      width: 4px;
-      background: linear-gradient(to top, #28a745, #20c997);
+      width: 3px;
+      background: linear-gradient(to top, #fff, #20c997);
       border-radius: 2px;
       transition: height 0.1s ease;
       height: 2px;
     }
     .meter-label {
-      font-size: 12px;
-      font-weight: 600;
-      color: #28a745;
-      min-width: 50px;
+      font-size: 16px;
     }
     /* Tablet: 640px - 1024px */
     @media (min-width: 640px) {
@@ -137,7 +144,8 @@
     <div class="status disconnected" id="status"><span class="status-dot"></span>Disconnected</div>
     <p class="info">Make sure home device is running the camera feed.</p>
     <video id="video" autoplay playsinline muted></video>
-    <div class="audio-meter" id="audioMeter">
+    <div class="audio-meter hidden" id="audioMeter">
+      <span class="meter-label">🔊</span>
       <div class="meter-bars">
         <div class="meter-bar" id="bar1"></div>
         <div class="meter-bar" id="bar2"></div>
@@ -145,7 +153,6 @@
         <div class="meter-bar" id="bar4"></div>
         <div class="meter-bar" id="bar5"></div>
       </div>
-      <span class="meter-label">🔊 Audio</span>
     </div>
     <div class="button-group">
       <button onclick="connectToCamera()" title="Connect to camera">🔌</button>
@@ -164,6 +171,7 @@
     let analyser = null;
     let animationId = null;
     let isMuted = true; // Initially muted
+    let offerTimeout = null; // Timeout for waiting for answer from camera
 
     const videoElement = document.getElementById('video');
     const statusElement = document.getElementById('status');
@@ -234,16 +242,30 @@
         if (videoElement.srcObject) {
           videoElement.srcObject = null;
         }
+        if (offerTimeout) {
+          clearTimeout(offerTimeout);
+          offerTimeout = null;
+        }
         iceCandidateQueue = [];
         remoteDescriptionSet = false;
 
         updateStatus('Connecting to camera...', 'connecting');
 
-        // Connect WebSocket with token
+        // Connect WebSocket with token (with timeout)
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(`${protocol}//${window.location.host}/ws?token=${encodeURIComponent(accessToken)}`);
 
+        // Connection timeout
+        const connectionTimeout = setTimeout(() => {
+          if (ws && ws.readyState !== WebSocket.OPEN) {
+            ws.close();
+            updateStatus('❌ Connection timeout', 'disconnected');
+            console.error('WebSocket connection timeout');
+          }
+        }, 10000);
+
         ws.onopen = () => {
+          clearTimeout(connectionTimeout);
           console.log('WebSocket connected');
           createPeerConnection();
         };
@@ -253,18 +275,22 @@
         };
 
         ws.onerror = (error) => {
+          clearTimeout(connectionTimeout);
           console.error('WebSocket error:', error);
-          updateStatus('Connection error', 'disconnected');
+          updateStatus('❌ Connection error - check network', 'disconnected');
         };
 
         ws.onclose = (event) => {
+          clearTimeout(connectionTimeout);
           // Check if connection was rejected due to auth
           if (event.code === 1008 || event.code === 1006) {
             sessionStorage.removeItem('cloudwatch_token');
             accessToken = null;
             updateStatus('❌ Invalid token - reconnect to retry', 'disconnected');
-          } else {
+          } else if (event.code === 1000) {
             updateStatus('Disconnected', 'disconnected');
+          } else {
+            updateStatus('❌ Connection lost', 'disconnected');
           }
           
           // Reset state for reconnection
@@ -277,7 +303,10 @@
         };
       } catch (error) {
         console.error('Error:', error);
-        updateStatus(`Error: ${error.message}`, 'disconnected');
+        const errorMsg = error.name === 'SecurityError' 
+          ? 'Security error - check HTTPS/WSS'
+          : error.message;
+        updateStatus(`❌ Error: ${errorMsg}`, 'disconnected');
       }
     }
 
@@ -352,12 +381,12 @@
             updateStatus('⏳ Connecting to camera...', 'connecting');
             break;
           case 'disconnected':
-            updateStatus('⚠️ Connection lost', 'connecting');
+            updateStatus('⚠️ Connection lost - reconnecting...', 'connecting');
             // Note: Connection might recover on its own, so we don't immediately reconnect
             // If it doesn't recover, it will transition to 'failed' and trigger reconnection
             break;
           case 'failed':
-            updateStatus('❌ Connection failed', 'disconnected');
+            updateStatus('❌ Connection failed - retrying...', 'disconnected');
             // Try to reconnect
             setTimeout(() => {
               console.log('Attempting to reconnect after failure');
@@ -378,6 +407,9 @@
       console.log('Peer connection created, calling makeOffer');
       // Send offer to camera
       makeOffer();
+      
+      // Update status to indicate we're waiting for camera
+      updateStatus('⏳ Waiting for camera...', 'connecting');
     }
 
     async function makeOffer() {
@@ -394,6 +426,16 @@
             offer: offer
           }));
           console.log('Offer sent successfully');
+          
+          // Set timeout for waiting for answer from camera
+          if (offerTimeout) clearTimeout(offerTimeout);
+          offerTimeout = setTimeout(() => {
+            if (peerConnection && peerConnection.connectionState !== 'connected') {
+              console.warn('No answer received from camera - camera may be offline');
+              updateStatus('❌ Camera offline - no response', 'disconnected');
+              disconnect();
+            }
+          }, 8000); // 8 second timeout
         } else {
           console.error('WebSocket not ready. State:', ws?.readyState);
         }
@@ -408,6 +450,13 @@
         console.log('💬 Signaling message received:', message.type);
         if (message.type === 'answer') {
           console.log('Processing answer...');
+          
+          // Clear the offer timeout - camera responded!
+          if (offerTimeout) {
+            clearTimeout(offerTimeout);
+            offerTimeout = null;
+          }
+          
           if (!peerConnection) {
             console.error('ERROR: No peer connection when receiving answer!');
             return;
@@ -472,6 +521,10 @@
         audioContext.close();
         audioContext = null;
       }
+      if (offerTimeout) {
+        clearTimeout(offerTimeout);
+        offerTimeout = null;
+      }
       analyser = null;
       videoElement.srcObject = null;
       videoElement.muted = true;
@@ -513,25 +566,34 @@
       const animate = () => {
         animationId = requestAnimationFrame(animate);
         
-        analyser.getByteFrequencyData(dataArray);
-        
-        // Get average level
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) {
-          sum += dataArray[i];
+        // Only update if not muted
+        if (!isMuted) {
+          analyser.getByteFrequencyData(dataArray);
+          
+          // Get average level
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+          }
+          const average = sum / dataArray.length;
+          const level = (average / 255) * 100;
+          
+          // Update meter bars
+          const bars = document.querySelectorAll('.meter-bar');
+          const barHeight = (level / 100) * 20;
+          
+          bars.forEach((bar, index) => {
+            const frequency = dataArray[Math.floor((index / bars.length) * dataArray.length)];
+            const height = (frequency / 255) * 20;
+            bar.style.height = height + 'px';
+          });
+        } else {
+          // Reset bars when muted
+          const bars = document.querySelectorAll('.meter-bar');
+          bars.forEach(bar => {
+            bar.style.height = '2px';
+          });
         }
-        const average = sum / dataArray.length;
-        const level = (average / 255) * 100;
-        
-        // Update meter bars
-        const bars = document.querySelectorAll('.meter-bar');
-        const barHeight = (level / 100) * 20;
-        
-        bars.forEach((bar, index) => {
-          const frequency = dataArray[Math.floor((index / bars.length) * dataArray.length)];
-          const height = (frequency / 255) * 20;
-          bar.style.height = height + 'px';
-        });
       };
       
       animate();
@@ -542,6 +604,14 @@
       videoElement.muted = isMuted;
       muteBtn.textContent = isMuted ? '🔇' : '🔊';
       muteBtn.title = isMuted ? 'Unmute audio' : 'Mute audio';
+      
+      // Update meter visibility
+      if (isMuted) {
+        audioMeterElement.classList.add('hidden');
+      } else {
+        audioMeterElement.classList.remove('hidden');
+      }
+      
       console.log('Audio', isMuted ? 'muted' : 'unmuted');
     }
 

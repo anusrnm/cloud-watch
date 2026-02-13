@@ -1,6 +1,7 @@
-import { serveFile, serveDir } from "jsr:@std/http@1/file-server";
+import { serveDir } from "jsr:@std/http@1/file-server";
 
 const clients = new Map<string, WebSocket>();
+const clientRoles = new Map<string, 'camera' | 'viewer'>(); // Track client roles
 
 // Security: Validate access token
 const ACCESS_TOKEN = Deno.env.get("ACCESS_TOKEN");
@@ -19,6 +20,28 @@ function validateToken(req: Request): boolean {
   const url = new URL(req.url);
   const token = url.searchParams.get("token");
   return token === ACCESS_TOKEN;
+}
+
+function broadcastViewerCount() {
+  // Count viewers (clients that sent 'offer')
+  let viewerCount = 0;
+  clientRoles.forEach(role => {
+    if (role === 'viewer') viewerCount++;
+  });
+
+  // Send count to all camera clients
+  const countMessage = JSON.stringify({
+    type: 'viewer-count',
+    count: viewerCount
+  });
+
+  clients.forEach((client, id) => {
+    if (clientRoles.get(id) === 'camera' && client.readyState === WebSocket.OPEN) {
+      client.send(countMessage);
+    }
+  });
+
+  console.log(`[${new Date().toISOString()}] Viewer count: ${viewerCount}`);
 }
 
 Deno.serve(async (req) => {
@@ -54,6 +77,13 @@ Deno.serve(async (req) => {
           return;
         }
 
+        // Track client role based on their first message
+        if (message.type === 'answer') {
+          clientRoles.set(clientId, 'camera');
+        } else if (message.type === 'offer') {
+          clientRoles.set(clientId, 'viewer');
+        }
+
         // Validate offer/answer/candidate exist and aren't empty
         if (message.type === 'offer' && !message.offer) {
           console.warn(`[${new Date().toISOString()}] Invalid offer from ${clientId}: missing offer data`);
@@ -77,6 +107,9 @@ Deno.serve(async (req) => {
             client.send(event.data);
           }
         });
+
+        // Send viewer count to camera clients
+        broadcastViewerCount();
       } catch (error) {
         console.error(`[${new Date().toISOString()}] Error parsing message from ${clientId}:`, error);
       }
@@ -84,7 +117,11 @@ Deno.serve(async (req) => {
 
     socket.onclose = () => {
       clients.delete(clientId);
+      clientRoles.delete(clientId);
       console.log(`[${new Date().toISOString()}] Client disconnected: ${clientId}`);
+      
+      // Update viewer count for remaining clients
+      broadcastViewerCount();
     };
 
     socket.onerror = (error) => {
